@@ -53,7 +53,7 @@ async function connectToMongoDB() {
     console.log('🔌 Connecting to MongoDB Atlas...')
     const client = new MongoClient(process.env.MONGODB_URI)
     await client.connect()
-    db = client.db('afterschoolDB')
+    db = client.db('Shopping')
     lessonsCollection = db.collection('lessons')
     ordersCollection = db.collection('orders')
     console.log('✅ Connected to MongoDB Atlas')
