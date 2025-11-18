@@ -1,136 +1,203 @@
-// server.js
-console.log('🟢 Server file starting...')
+require("dotenv").config();
 
-import express from 'express'
-import cors from 'cors'
-import dotenv from 'dotenv'
-import { MongoClient, ObjectId } from 'mongodb'
-import path from 'path'
-import { fileURLToPath } from 'url'
+const express = require("express");
+const cors = require("cors");
+const { MongoClient, ObjectId } = require("mongodb");
 
-// Allow __dirname in ES modules
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-// Load environment variables
-dotenv.config()
+// ====== Custom logger middleware ======
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
+});
 
-const app = express()
-const PORT = process.env.PORT || 3000
+// ====== Serve static images ======
+app.use("/images", express.static("images"));
 
-// ====== LOGGER MIDDLEWARE (INLINE) ======
-const logger = (req, res, next) => {
-  const now = new Date().toISOString()
-  console.log(`[${now}] ${req.method} ${req.url}`)
-  next()
+// ====== Env & Mongo client ======
+const PORT = process.env.PORT || 3000;
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+  console.error("MONGODB_URI not set in .env");
+  process.exit(1);
 }
 
-// ====== MIDDLEWARE ======
-app.use(cors())
-app.use(express.json())
-app.use(logger) // logs every request to the console
+const client = new MongoClient(MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true });
 
-// ====== STATIC FILE MIDDLEWARE ======
-app.use(
-  '/images',
-  express.static(path.join(__dirname, 'public/images'), { fallthrough: false })
-)
+let lessonsCollection;
+let ordersCollection;
 
-// Custom error handler for missing static files
-app.use((err, req, res, next) => {
-  if (err.status === 404) {
-    res.status(404).json({ message: 'Image not found' })
-  } else {
-    next(err)
-  }
-})
-
-// ====== DATABASE CONNECTION ======
-let db, lessonsCollection, ordersCollection
-
-async function connectToMongoDB() {
+async function migrateTopicToSubject(db) {
   try {
-    console.log('🔌 Connecting to MongoDB Atlas...')
-    const client = new MongoClient(process.env.MONGODB_URI)
-    await client.connect()
-    db = client.db('Shopping')
-    lessonsCollection = db.collection('lessons')
-    ordersCollection = db.collection('orders')
-    console.log('✅ Connected to MongoDB Atlas')
+    // Only update documents that have 'topic' and do not already have 'subject'
+    const result = await db.collection("lessons").updateMany(
+      { topic: { $exists: true }, subject: { $exists: false } },
+      [
+        // aggregation pipeline update: set subject = topic, unset topic
+        { $set: { subject: "$topic" } },
+        { $unset: "topic" }
+      ]
+    );
+
+    if (result.matchedCount > 0) {
+      console.log(`Migration: converted ${result.matchedCount} lesson(s) from 'topic' -> 'subject'.`);
+    } else {
+      console.log("Migration: no 'topic' fields found or already migrated.");
+    }
   } catch (err) {
-    console.error('❌ MongoDB connection failed:', err)
+    console.error("Migration error:", err);
   }
 }
 
-// ====== ROUTES ======
-
-// Root test route
-app.get('/', (req, res) => res.send('✅ Backend running successfully!'))
-
-// ✅ GET /lessons — fetch all lessons
-app.get('/lessons', async (req, res) => {
+async function start() {
   try {
-    const lessons = await lessonsCollection.find().toArray()
-    res.status(200).json(lessons)
+    await client.connect();
+    console.log("Connected to MongoDB Atlas.");
+
+    // Use DB name from connection string (or default)
+    const db = client.db(); // connection string already contains the DB "Shopping"
+    lessonsCollection = db.collection("lessons");
+    ordersCollection = db.collection("orders");
+
+    // Run migration to rename topic -> subject if needed
+    await migrateTopicToSubject(db);
+
+    // Start server only after DB is ready
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+    });
   } catch (err) {
-    console.error('❌ Error fetching lessons:', err)
-    res.status(500).json({ message: 'Error fetching lessons' })
+    console.error("Failed to start server:", err);
+    process.exit(1);
   }
-})
+}
 
-// ✅ POST /orders — create a new order
-app.post('/orders', async (req, res) => {
-  const { name, phone, lessons } = req.body
-  if (!name || !phone || !Array.isArray(lessons) || lessons.length === 0) {
-    return res.status(400).json({ message: 'Invalid order data' })
-  }
+start();
 
+// ================= ROUTES =================
+
+// GET /lessons - return all lessons
+app.get("/lessons", async (req, res) => {
   try {
-    const newOrder = {
+    const lessons = await lessonsCollection.find().toArray();
+    res.json(lessons);
+  } catch (err) {
+    console.error("GET /lessons error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /orders - create an order (validation included)
+app.post("/orders", async (req, res) => {
+  try {
+    const { name, phone, lessonIDs, spaces } = req.body;
+
+    // Basic validation
+    if (!name || !/^[A-Za-z\s]+$/.test(name)) {
+      return res.status(400).json({ error: "Name is required and must contain letters only" });
+    }
+    if (!phone || !/^[0-9]+$/.test(phone)) {
+      return res.status(400).json({ error: "Phone is required and must contain numbers only" });
+    }
+    if (!Array.isArray(lessonIDs) || lessonIDs.length === 0) {
+      return res.status(400).json({ error: "lessonIDs must be a non-empty array" });
+    }
+    if (typeof spaces !== "number" || spaces <= 0) {
+      return res.status(400).json({ error: "spaces must be a positive number" });
+    }
+
+    const orderDoc = {
       name,
       phone,
-      lessons, // [{ lessonId, qty }]
+      lessonIDs,
+      spaces,
       createdAt: new Date()
-    }
-    const result = await ordersCollection.insertOne(newOrder)
-    res.status(201).json({ message: '✅ Order created', orderId: result.insertedId })
+    };
+
+    const result = await ordersCollection.insertOne(orderDoc);
+    res.json({ message: "Order saved", id: result.insertedId });
   } catch (err) {
-    console.error('❌ Failed to save order:', err)
-    res.status(500).json({ message: 'Error saving order' })
+    console.error("POST /orders error:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
-})
+});
 
-// ✅ PUT /lessons/:id — update lesson fields (e.g. spaces)
-app.put('/lessons/:id', async (req, res) => {
-  const { id } = req.params
-  const updateData = req.body // e.g. { spaces: 3 }
-
-  if (!updateData || typeof updateData !== 'object') {
-    return res.status(400).json({ message: 'Invalid update data' })
-  }
-
+// PUT /lessons/:id - update only allowed fields (subject, location, price, space, image)
+app.put("/lessons/:id", async (req, res) => {
   try {
+    const id = req.params.id;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid lesson id" });
+    }
+
+    const allowedFields = ["subject", "location", "price", "space", "image"];
+    const update = {};
+    for (const key of allowedFields) {
+      if (req.body.hasOwnProperty(key)) {
+        update[key] = req.body[key];
+      }
+    }
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: "No valid fields provided for update" });
+    }
+
+    // If price or space provided, ensure they are numbers
+    if (update.price !== undefined && typeof update.price !== "number") {
+      return res.status(400).json({ error: "price must be a number" });
+    }
+    if (update.space !== undefined && typeof update.space !== "number") {
+      return res.status(400).json({ error: "space must be a number" });
+    }
+
     const result = await lessonsCollection.updateOne(
       { _id: new ObjectId(id) },
-      { $set: updateData }
-    )
+      { $set: update }
+    );
 
     if (result.matchedCount === 0) {
-      return res.status(404).json({ message: 'Lesson not found' })
+      return res.status(404).json({ error: "Lesson not found" });
     }
 
-    res.json({ message: '✅ Lesson updated successfully' })
+    res.json({ message: "Lesson updated", matchedCount: result.matchedCount, modifiedCount: result.modifiedCount });
   } catch (err) {
-    console.error('❌ Error updating lesson:', err)
-    res.status(500).json({ message: 'Error updating lesson' })
+    console.error("PUT /lessons/:id error:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
-})
+});
 
-// Fallback 404 for unknown routes
-app.use((req, res) => res.status(404).json({ message: 'Route not found' }))
+// GET /search?query=... - backend search (subject, location, price, space)
+app.get("/search", async (req, res) => {
+  try {
+    const q = (req.query.query || "").trim();
+    if (q === "") {
+      // return all if empty
+      const all = await lessonsCollection.find().toArray();
+      return res.json(all);
+    }
 
-// ====== START SERVER ======
-app.listen(PORT, async () => {
-  await connectToMongoDB()
-  console.log(`🚀 Server running on http://localhost:${PORT}`)
-})
+    // Build OR conditions. For price/space try numeric match, also regex fallback.
+    const or = [
+      { subject: { $regex: q, $options: "i" } },
+      { location: { $regex: q, $options: "i" } }
+    ];
+
+    // If query looks numeric, add numeric equality checks for price/space
+    if (!isNaN(Number(q))) {
+      const num = Number(q);
+      or.push({ price: num }, { space: num });
+    } else {
+      // fallback: regex against stringified price/space
+      or.push({ price: { $regex: q, $options: "i" } }, { space: { $regex: q, $options: "i" } });
+    }
+
+    const results = await lessonsCollection.find({ $or: or }).toArray();
+    res.json(results);
+  } catch (err) {
+    console.error("GET /search error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
