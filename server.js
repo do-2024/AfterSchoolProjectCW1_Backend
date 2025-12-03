@@ -4,166 +4,203 @@ dotenv.config();
 import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
-
-// For serving images in /images folder
 import path from "path";
 import { fileURLToPath } from "url";
 
+/* -----------------------
+   Setup paths
+------------------------ */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/* -----------------------
+   App setup
+------------------------ */
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Static images
+/* -----------------------
+   Static images folder
+------------------------ */
 app.use("/images", express.static(path.join(__dirname, "images")));
 
-// Logger middleware
+/* -----------------------
+   Logger
+------------------------ */
 app.use((req, res, next) => {
-    console.log(`${req.method} ${req.url} - ${new Date().toISOString()}`);
-    next();
+  console.log(req.method, req.url);
+  next();
 });
 
-const mongoURI = process.env.MONGODB_URI;
-const client = new MongoClient(mongoURI);
+/* -----------------------
+   MongoDB Connection
+------------------------ */
+const client = new MongoClient(process.env.MONGODB_URI);
 
 let lessonsCollection;
 let ordersCollection;
 
-// Connect to MongoDB
 async function connectDB() {
-    try {
-        await client.connect();
-        const db = client.db("Shopping");
+  try {
+    await client.connect();
+    const db = client.db("Shopping"); // ✅ THIS MUST MATCH YOUR DB
 
-        lessonsCollection = db.collection("lessons");
-        ordersCollection = db.collection("orders");
+    lessonsCollection = db.collection("lessons");
+    ordersCollection = db.collection("orders");
 
-        console.log("Connected to MongoDB!");
-    } catch (err) {
-        console.error("DB connection error:", err);
-    }
+    console.log("✅ MongoDB Connected Successfully!");
+  } catch (err) {
+    console.error("❌ MongoDB Connection Failed:", err.message);
+  }
 }
 
 connectDB();
 
-/* ===========================
-   GET ALL LESSONS
-=========================== */
+/* -----------------------
+   Safety middleware
+------------------------ */
+app.use((req, res, next) => {
+  if (!lessonsCollection) {
+    return res.status(503).json({ error: "Database not connected yet" });
+  }
+  next();
+});
+
+/* -----------------------
+   GET all lessons
+------------------------ */
 app.get("/lessons", async (req, res) => {
-    try {
-        const lessons = await lessonsCollection.find().toArray();
-        res.json(lessons);
-    } catch (err) {
-        res.status(500).json({ error: "Failed to fetch lessons" });
-    }
+  try {
+    const lessons = await lessonsCollection.find({}).toArray();
+    res.json(lessons);
+  } catch (err) {
+    console.error("LESSONS ERROR:", err);
+    res.status(500).json({ error: "Failed to fetch lessons" });
+  }
 });
 
-/* ===========================
-   SEARCH LESSONS
-=========================== */
+/* -----------------------
+   SEARCH lessons
+------------------------ */
 app.get("/search", async (req, res) => {
-    const query = req.query.q;
+  const query = req.query.q?.trim();
+  if (!query) return res.json([]);
 
-    if (!query || query.trim() === "") {
-        return res.json([]);
-    }
+  const regex = new RegExp(query, "i");
 
-    const regex = new RegExp(query, "i"); // case-insensitive
+  try {
+    const results = await lessonsCollection.find({
+      $or: [
+        { topic: regex },     // ✅ FIXED
+        { location: regex }   // ✅ ALREADY CORRECT
+      ]
+    }).toArray();
 
-    try {
-        const results = await lessonsCollection.find({
-            $or: [
-                { subject: regex },
-                { location: regex },
-                { price: { $regex: regex } }, 
-                { space: { $regex: regex } }
-            ]
-        }).toArray();
-
-        res.json(results);
-    } catch (err) {
-        res.status(500).json({ error: "Search failed" });
-    }
+    res.json(results);
+  } catch (err) {
+    console.error("SEARCH ERROR:", err);
+    res.status(500).json({ error: "Search failed" });
+  }
 });
 
-/* ===========================
-   PLACE ORDER
-=========================== */
+
+
+/* -----------------------
+   GET all orders
+------------------------ */
+app.get("/orders", async (req, res) => {
+  try {
+    const orders = await ordersCollection.find({}).toArray();
+    res.status(200).json(orders);
+  } catch (err) {
+    console.error("GET ORDERS ERROR:", err);
+    res.status(500).json({ error: "Failed to fetch orders" });
+  }
+});
+
+
+
+
+
+/* -----------------------
+   POST order
+------------------------ */
 app.post("/orders", async (req, res) => {
-    const { lessonId, name, phone, quantity } = req.body;
+  const { items, name, phone } = req.body;
 
-    if (!lessonId || !name || !phone || !quantity) {
-        return res.status(400).json({ error: "Missing required fields" });
+  if (!items || !name || !phone) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    for (const item of items) {
+      const lessonId = new ObjectId(item.lessonId);
+      const qty = item.qty;
+
+      const lesson = await lessonsCollection.findOne({ _id: lessonId });
+
+      if (!lesson) {
+        return res.status(404).json({ error: "Lesson not found" });
+      }
+
+      if (lesson.space < qty) {
+        return res.status(400).json({ error: "Not enough spaces" });
+      }
+
+      await ordersCollection.insertOne({
+        name,
+        phone,
+        lessonId,
+        qty,
+        date: new Date(),
+      });
+
+      await lessonsCollection.updateOne(
+        { _id: lessonId },
+        { $inc: { space: -qty } }
+      );
     }
 
-    try {
-        // Convert lessonId into ObjectId
-        const lesson = await lessonsCollection.findOne({
-            _id: new ObjectId(lessonId)
-        });
-
-        if (!lesson) {
-            return res.status(404).json({ error: "Lesson not found" });
-        }
-
-        // Check if enough spaces exist
-        if (lesson.space < quantity) {
-            return res.status(400).json({ error: "Not enough spaces available" });
-        }
-
-        // Insert order into DB
-        await ordersCollection.insertOne({
-            lessonId,
-            name,
-            phone,
-            quantity,
-            date: new Date()
-        });
-
-        // Reduce available spaces
-        await lessonsCollection.updateOne(
-            { _id: lesson._id },
-            { $inc: { space: -quantity } }
-        );
-
-        res.json({ message: "Order placed successfully!" });
-    } catch (err) {
-        res.status(500).json({ error: "Order failed" });
-    }
+    res.json({ message: "✅ Order placed successfully!" });
+  } catch (err) {
+    console.error("ORDER ERROR:", err);
+    res.status(500).json({ error: "Order failed" });
+  }
 });
 
-/* ===========================
-   UPDATE SPACES (PUT)
-=========================== */
+/* -----------------------
+   UPDATE lesson spaces
+------------------------ */
 app.put("/lessons/:id", async (req, res) => {
-    const id = req.params.id;
-    const { space } = req.body;
+  const { space } = req.body;
 
-    if (typeof space !== "number") {
-        return res.status(400).json({ error: "Space must be a number" });
+  if (typeof space !== "number") {
+    return res.status(400).json({ error: "Space must be a number" });
+  }
+
+  try {
+    const result = await lessonsCollection.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { space } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ error: "Lesson not found" });
     }
 
-    try {
-        const result = await lessonsCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $set: { space } }
-        );
-
-        if (result.matchedCount === 0) {
-            return res.status(404).json({ error: "Lesson not found" });
-        }
-
-        res.json({ message: "Space updated successfully" });
-    } catch (err) {
-        res.status(500).json({ error: "Failed to update space" });
-    }
+    res.json({ message: "✅ Space updated" });
+  } catch (err) {
+    console.error("PUT ERROR:", err);
+    res.status(500).json({ error: "Failed to update space" });
+  }
 });
 
-// Start server
+/* -----------------------
+   Start Server
+------------------------ */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
 
+app.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
+});
